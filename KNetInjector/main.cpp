@@ -83,30 +83,30 @@ void GetPidForName(const char* name, int& pid)
 }
 
 
-void ToggleRWXPageProtection(HANDLE hProcess, DWORD BaseAddress)
+void ToggleRWXPageProtection(HANDLE hProcess, PVOID BaseAddress)
 {
-  DWORD CurrentAddress = BaseAddress;
+  PVOID CurrentAddress = BaseAddress;
   MEMORY_BASIC_INFORMATION mbi2;
   do
   {
     ZeroMemory(&mbi2, sizeof(mbi2));
     VirtualQueryEx(hProcess, (LPCVOID)CurrentAddress, &mbi2, sizeof(mbi2));
-    if ((DWORD)mbi2.AllocationBase != BaseAddress)
+    if (mbi2.AllocationBase != BaseAddress)
       break;
-    printf("Scanning: BaseAddr:%p, AllocAddr:%p, RegionSz:0x%X, Current:0x%X, Protect: 0x%X\n",
+    printf("Scanning: BaseAddr:%p, AllocAddr:%p, RegionSz:0x%lX, Current:0x%p, Protect: 0x%X\n",
       mbi2.BaseAddress, mbi2.AllocationBase, mbi2.RegionSize, CurrentAddress, mbi2.Protect);
 
     DWORD nextProtect = 0;
     if (mbi2.Protect == PAGE_EXECUTE_READ)
     {
-      printf("Updating Current:0x%X (0x%X) to PAGE_EXECUTE_READWRITE (0x%X)\n",
+      printf("Updating Current:0x%lX (0x%lX) to PAGE_EXECUTE_READWRITE (0x%X)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READWRITE);
       nextProtect = PAGE_EXECUTE_READWRITE;
     }
     else if (mbi2.Protect == PAGE_EXECUTE_READWRITE ||
              mbi2.Protect == PAGE_EXECUTE_WRITECOPY) //No idea why post-load it does this
     {
-      printf("Updating Current:0x%X (0x%X) to PAGE_EXECUTE_READ (0x%X)\n",
+      printf("Updating Current:0x%p (0x%lX) to PAGE_EXECUTE_READ (0x%lX)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READ);
       nextProtect = PAGE_EXECUTE_READ;
     }
@@ -117,9 +117,11 @@ void ToggleRWXPageProtection(HANDLE hProcess, DWORD BaseAddress)
     {
       PrintGetLastError();
     }
-     next_iter:
-     CurrentAddress += mbi2.RegionSize;
-  } while ((DWORD)mbi2.AllocationBase == BaseAddress);
+  next_iter:
+    intptr_t ptr_arith = (intptr_t)CurrentAddress;
+    ptr_arith += mbi2.RegionSize;
+    CurrentAddress = (PVOID)ptr_arith;
+  } while (mbi2.AllocationBase == BaseAddress);
 }
 
 enum InjectStyle { NONE, INJECT_AFTER_LOAD, LOAD_AND_INJECT };
@@ -215,8 +217,14 @@ int main(int argc, char* argv[])
   if (argslength > 0 && style != InjectStyle::LOAD_AND_INJECT)
     printf("Ignoring -args option, you can only use this with -load\n");
 
+#if defined(_WIN64)
+  printf("Running in 64-bit mode, ensure you are using a 64-bit dll and target\n");
+#else
+  printf("Running in 32-bit mode, ensure you are using a 32-bit dll and target\n");
+#endif
+
   PROCESS_INFORMATION pi;
-  PPEB pebBaseAddress = NULL;
+  PPEB threadContextPEBAddress = NULL;
   if (style == InjectStyle::LOAD_AND_INJECT)
   {
     if (exename == nullptr || exelength == 0)
@@ -244,6 +252,7 @@ int main(int argc, char* argv[])
     pid = pi.dwProcessId;
     printf("Created process %s with pid %d in suspend state\n", exename, pid);
 
+
     CONTEXT context;
     ZeroMemory(&context, sizeof(context));
     context.ContextFlags = CONTEXT_INTEGER;
@@ -252,8 +261,14 @@ int main(int argc, char* argv[])
       PrintGetLastError();
       return 0;
     }
-    printf("GetThreadContext::Ebx 0x%x\n", context.Ebx);
-    pebBaseAddress = (PPEB)context.Ebx;
+
+#if defined(_WIN64)
+    printf("(64-bit) GetThreadContext::Rdx 0x%zX\n", context.Rdx);
+    threadContextPEBAddress = (PPEB)context.Rdx;
+#else
+    printf("(32-bit) GetThreadContext::Ebx 0x%X\n", context.Ebx);
+    threadContextPEBAddress = (PPEB)context.Ebx;
+#endif
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
@@ -278,7 +293,7 @@ int main(int argc, char* argv[])
   }
 
 
-  DWORD BaseAddress = NULL;
+  PVOID BaseAddress = NULL;
   PROCESS_BASIC_INFORMATION pbi;
   ZeroMemory(&pbi, sizeof(PROCESS_BASIC_INFORMATION));
   ULONG returnLength = 0;
@@ -286,19 +301,51 @@ int main(int argc, char* argv[])
     sizeof(PROCESS_BASIC_INFORMATION), &returnLength);
   printf("NtQueryInformationProcess::PebBaseAddress %p\n", pbi.PebBaseAddress);
 
-  if (pebBaseAddress != pbi.PebBaseAddress)
-    printf("Thread context PEB doesn't match NtQuery PEB\n");
+  PPEB pebBaseAddress = NULL;
+  if (threadContextPEBAddress != NULL)
+  {
+    if (pbi.PebBaseAddress == NULL)
+    {
+      printf("PROCESS_BASIC_INFORMATION has null entry value, defaulting to CONTEXT\n");
+      pebBaseAddress = threadContextPEBAddress;
+    }
+    else if (threadContextPEBAddress != pbi.PebBaseAddress)
+    {
+      printf("PROCESS_BASIC_INFORMATION does not match CONTEXT, defaulting to PROCESS_BASIC_INFORMATION\n");
+      pebBaseAddress = pbi.PebBaseAddress;
+    }
+    else
+    {
+      printf("PROCESS_BASIC_INFORMATION matches CONTEXT\n");
+      pebBaseAddress = pbi.PebBaseAddress;
+    }
+  }
   else
-    printf("PEB Base Address: %p\n", pbi.PebBaseAddress);
+  {
+    if (pbi.PebBaseAddress == NULL)
+    {
+      printf("Both PROCESS_BASIC_INFORMATION and CONTEXT do not have an entry point\n");
+      return 0;
+    }
+    else
+    {
+      printf("CONTEXT has null entry value, defaulting to PROCESS_BASIC_INFORMATION\n");
+      pebBaseAddress = pbi.PebBaseAddress;
+    }
+  }
 
-  PPEB pebImageBaseOffset = pbi.PebBaseAddress + 8;
-  if (!ReadProcessMemory(ProcessHandle, ((PBYTE)pebBaseAddress + 8),
-    &BaseAddress, sizeof(DWORD), NULL))
+  printf("PEB Base Address: %p\n", pebBaseAddress);
+
+  PEB peb;
+  if (!ReadProcessMemory(ProcessHandle, pebBaseAddress, &peb, sizeof(PEB), NULL))
   {
     PrintGetLastError();
     return 0;
   }
-  printf("Module Base Address: 0x%X\n", BaseAddress);
+
+  BaseAddress = peb.Reserved3[1];
+  printf("Module Base Address (entry): %p\n", BaseAddress);
+
 
   HMODULE Kernel32Module = GetModuleHandle("kernel32.dll");
   if (Kernel32Module == NULL)
