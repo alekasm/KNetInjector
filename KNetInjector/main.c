@@ -9,7 +9,6 @@ Written by Aleksander Krimsky
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <winternl.h>
-#include <conio.h>
 #pragma comment(lib, "ntdll")
 
 void PrintGetLastError()
@@ -33,7 +32,7 @@ void PrintGetLastError()
 
 enum ThreadControl { SUSPEND, RESUME };
 
-void thread_control(DWORD processId, ThreadControl ctrl)
+void thread_control(DWORD processId, enum ThreadControl ctrl)
 {
   HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
   THREADENTRY32 threadEntry;
@@ -64,9 +63,9 @@ void thread_control(DWORD processId, ThreadControl ctrl)
   CloseHandle(hThreadSnapshot);
 }
 
-void GetPidForName(const char* name, int& pid)
+void GetPidForName(const char* name, int* pid)
 {
-  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   PROCESSENTRY32 entry;
   entry.dwSize = sizeof(PROCESSENTRY32);
   if (Process32First(snapshot, &entry) == TRUE)
@@ -75,7 +74,7 @@ void GetPidForName(const char* name, int& pid)
     {
       if (strcmp(entry.szExeFile, name) == 0)
       {
-        pid = entry.th32ProcessID;
+        *pid = entry.th32ProcessID;
         return;
       }
     }
@@ -93,20 +92,20 @@ void ToggleRWXPageProtection(HANDLE hProcess, PVOID BaseAddress)
     VirtualQueryEx(hProcess, (LPCVOID)CurrentAddress, &mbi2, sizeof(mbi2));
     if (mbi2.AllocationBase != BaseAddress)
       break;
-    printf("Scanning: BaseAddr:%p, AllocAddr:%p, RegionSz:0x%lX, Current:0x%p, Protect: 0x%X\n",
+    printf("Scanning: BaseAddr:0x%p, AllocAddr:%p, RegionSz:0x%llX, Current:0x%p, Protect: 0x%X\n",
       mbi2.BaseAddress, mbi2.AllocationBase, mbi2.RegionSize, CurrentAddress, mbi2.Protect);
 
     DWORD nextProtect = 0;
     if (mbi2.Protect == PAGE_EXECUTE_READ)
     {
-      printf("Updating Current:0x%lX (0x%lX) to PAGE_EXECUTE_READWRITE (0x%X)\n",
+      printf("Updating Current:0x%p (0x%llX) to PAGE_EXECUTE_READWRITE (0x%X)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READWRITE);
       nextProtect = PAGE_EXECUTE_READWRITE;
     }
     else if (mbi2.Protect == PAGE_EXECUTE_READWRITE ||
              mbi2.Protect == PAGE_EXECUTE_WRITECOPY) //No idea why post-load it does this
     {
-      printf("Updating Current:0x%p (0x%lX) to PAGE_EXECUTE_READ (0x%lX)\n",
+      printf("Updating Current:0x%p (0x%llX) to PAGE_EXECUTE_READ (0x%lX)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READ);
       nextProtect = PAGE_EXECUTE_READ;
     }
@@ -118,25 +117,27 @@ void ToggleRWXPageProtection(HANDLE hProcess, PVOID BaseAddress)
       PrintGetLastError();
     }
   next_iter:
-    intptr_t ptr_arith = (intptr_t)CurrentAddress;
-    ptr_arith += mbi2.RegionSize;
-    CurrentAddress = (PVOID)ptr_arith;
+    {
+      long long ptr_arith = (long long)CurrentAddress;
+      ptr_arith += mbi2.RegionSize;
+      CurrentAddress = (PVOID)ptr_arith;
+    }
   } while (mbi2.AllocationBase == BaseAddress);
 }
 
 enum InjectStyle { NONE, INJECT_AFTER_LOAD, LOAD_AND_INJECT };
 int main(int argc, char* argv[])
 {
-  bool wait_for_inject = true;
-  bool rwx = false;
+  BOOL wait_for_inject = TRUE;
+  BOOL rwx = TRUE;
   int pid = 0;
-  char* dllname = nullptr;
-  char* exename = nullptr;
-  char* args = nullptr;
-  int argslength = 0;
-  int dlllength = 0;
-  int exelength = 0;
-  InjectStyle style = InjectStyle::NONE;
+  char* dllname = NULL;
+  char* exename = NULL;
+  char* args = NULL;
+  size_t argslength = 0;
+  size_t dlllength = 0;
+  size_t exelength = 0;
+  enum InjectStyle style = NONE;
   if (argc < 2)
   {
     printf("KNetInjector v1.1 written by Aleksander Krimsky - www.krimsky.net\n");
@@ -153,8 +154,8 @@ int main(int argc, char* argv[])
   {
     if (strcmp(argv[i], "-find") == 0)
     {
-      style = InjectStyle::INJECT_AFTER_LOAD;
-      GetPidForName(argv[i + 1], pid);
+      style = INJECT_AFTER_LOAD;
+      GetPidForName(argv[i + 1], &pid);
       if (pid == 0)
       {
         printf("Unable to find pid for: %s\n", argv[i + 1]);
@@ -164,7 +165,7 @@ int main(int argc, char* argv[])
     }
     else if (strcmp(argv[i], "-pid") == 0)
     {
-      style = InjectStyle::INJECT_AFTER_LOAD;
+      style = INJECT_AFTER_LOAD;
       pid = atoi(argv[i + 1]);
       if (pid == 0)
       {
@@ -175,20 +176,30 @@ int main(int argc, char* argv[])
     }
     else if (strcmp(argv[i], "--rwx") == 0)
     {
-      rwx = true;
+      rwx = TRUE;
     }
     else if (strcmp(argv[i], "-args") == 0)
     {
-      argslength = strlen(argv[i + 1]);
-      args = new char[argslength + 1];
+      argslength = strlen(argv[i + 1]) + 1;
+      args = (char*)malloc(argslength);
+      if(args == NULL)
+      {
+        printf("Failed to allocate, out of memory - exiting...\n");
+        return 0;
+      }
       args[argslength] = 0;
       memcpy(args, argv[i + 1], argslength);
       ++i;
     }
     else if (strcmp(argv[i], "-dll") == 0)
     {
-      dlllength = strlen(argv[i + 1]);
-      dllname = new char[dlllength + 1];
+      dlllength = strlen(argv[i + 1]) + 1;
+      dllname = (char*)malloc(dlllength);
+      if (dllname == NULL)
+      {
+        printf("Failed to allocate, out of memory - exiting...\n");
+        return 0;
+      }
       dllname[dlllength] = 0;
       memcpy(dllname, argv[i + 1], dlllength);
       ++i;
@@ -196,25 +207,30 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[i], "-load") == 0)
     {
       style = LOAD_AND_INJECT;
-      exelength = strlen(argv[i + 1]);
-      exename = new char[exelength + 1];
+      exelength = strlen(argv[i + 1]) + 1;
+      exename = (char*)malloc(exelength);
+      if (exename == NULL)
+      {
+        printf("Failed to allocate, out of memory - exiting...\n");
+        return 0;
+      }
       exename[exelength] = 0;
       memcpy(exename, argv[i + 1], exelength);
       ++i;
     }
     else if (strcmp(argv[i], "--nowait") == 0)
     {
-      wait_for_inject = false;
+      wait_for_inject = FALSE;
     }
   }
 
-  if (dllname == nullptr || dlllength == 0)
+  if (dllname == NULL || dlllength == 0)
   {
     printf("No dll was specified for injection, please use -dll <path>\n");
     return 0;
   }
 
-  if (argslength > 0 && style != InjectStyle::LOAD_AND_INJECT)
+  if (argslength > 0 && style != LOAD_AND_INJECT)
     printf("Ignoring -args option, you can only use this with -load\n");
 
 #if defined(_WIN64)
@@ -225,9 +241,9 @@ int main(int argc, char* argv[])
 
   PROCESS_INFORMATION pi;
   PPEB threadContextPEBAddress = NULL;
-  if (style == InjectStyle::LOAD_AND_INJECT)
+  if (style == LOAD_AND_INJECT)
   {
-    if (exename == nullptr || exelength == 0)
+    if (exename == NULL || exelength == 0)
     {
       printf("No exe name was specified with -load <target.exe>\n");
       return 0;
@@ -237,12 +253,12 @@ int main(int argc, char* argv[])
     ZeroMemory(&si, sizeof(STARTUPINFOA));
     ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
     si.cb = sizeof(STARTUPINFOA);
-    int size = argslength + exelength + 2;//space + null terminator
-    char* cmd = new char[size];
+    size_t size = argslength + exelength + 2;//space + null terminator
+    char* cmd = (char*)malloc(size);
     memset(cmd, 0, size);
     snprintf(cmd, size, "%s %s", exename, args);
     printf("cmd = %s\n", cmd);
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, false,
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
       CREATE_SUSPENDED, NULL, NULL, &si, &pi))
     {
       printf("CreateProcessA has failed: %s\n", exename);
@@ -287,7 +303,7 @@ int main(int argc, char* argv[])
     PrintGetLastError();
     return 0;
   }
-  if (style == InjectStyle::INJECT_AFTER_LOAD)
+  if (style == INJECT_AFTER_LOAD)
   {
     thread_control(pid, SUSPEND);
   }
@@ -394,10 +410,11 @@ int main(int argc, char* argv[])
     ToggleRWXPageProtection(ProcessHandle, BaseAddress);
 
   //https://msdn.microsoft.com/en-us/library/aa964928.aspx
+  DWORD pThreadId;
   HANDLE ThreadHandle = CreateRemoteThread(
     ProcessHandle, NULL, 0,
     (LPTHREAD_START_ROUTINE)ProcAddress,
-    DllNameAddress, NULL, 0);
+    DllNameAddress, 0, &pThreadId);
 
   if (ThreadHandle == NULL)
   {
@@ -421,7 +438,11 @@ int main(int argc, char* argv[])
   CloseHandle(ProcessHandle);
 
   printf("Successfully injected %s into process: %d\n", dllname, pid);
-  printf("Press any key to exit...\n");
-  _getch();
+  if (dllname)
+    free(dllname);
+  if (exename)
+    free(exename);
+  if (args)
+    free(args);
   return 1;
 }
