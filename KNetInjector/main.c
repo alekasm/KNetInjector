@@ -11,6 +11,7 @@ Written by Aleksander Krimsky
 #include <winternl.h>
 #pragma comment(lib, "ntdll")
 
+
 void PrintGetLastError()
 {
   DWORD errorMessageID = GetLastError();
@@ -92,20 +93,20 @@ void ToggleRWXPageProtection(HANDLE hProcess, PVOID BaseAddress)
     VirtualQueryEx(hProcess, (LPCVOID)CurrentAddress, &mbi2, sizeof(mbi2));
     if (mbi2.AllocationBase != BaseAddress)
       break;
-    printf("Scanning: BaseAddr:0x%p, AllocAddr:%p, RegionSz:0x%llX, Current:0x%p, Protect: 0x%X\n",
+    printf("Scanning: BaseAddr:0x%p, AllocAddr:%p, RegionSz:0x%lX, Current:0x%p, Protect: 0x%X\n",
       mbi2.BaseAddress, mbi2.AllocationBase, mbi2.RegionSize, CurrentAddress, mbi2.Protect);
 
     DWORD nextProtect = 0;
     if (mbi2.Protect == PAGE_EXECUTE_READ)
     {
-      printf("Updating Current:0x%p (0x%llX) to PAGE_EXECUTE_READWRITE (0x%X)\n",
+      printf("Updating Current:0x%p (0x%lX) to PAGE_EXECUTE_READWRITE (0x%X)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READWRITE);
       nextProtect = PAGE_EXECUTE_READWRITE;
     }
     else if (mbi2.Protect == PAGE_EXECUTE_READWRITE ||
              mbi2.Protect == PAGE_EXECUTE_WRITECOPY) //No idea why post-load it does this
     {
-      printf("Updating Current:0x%p (0x%llX) to PAGE_EXECUTE_READ (0x%lX)\n",
+      printf("Updating Current:0x%p (0x%lX) to PAGE_EXECUTE_READ (0x%lX)\n",
         CurrentAddress, mbi2.RegionSize, PAGE_EXECUTE_READ);
       nextProtect = PAGE_EXECUTE_READ;
     }
@@ -410,11 +411,11 @@ int main(int argc, char* argv[])
     ToggleRWXPageProtection(ProcessHandle, BaseAddress);
 
   //https://msdn.microsoft.com/en-us/library/aa964928.aspx
-  DWORD pThreadId;
+  DWORD ThreadId;
   HANDLE ThreadHandle = CreateRemoteThread(
     ProcessHandle, NULL, 0,
     (LPTHREAD_START_ROUTINE)ProcAddress,
-    DllNameAddress, 0, &pThreadId);
+    DllNameAddress, 0, &ThreadId);
 
   if (ThreadHandle == NULL)
   {
@@ -425,7 +426,7 @@ int main(int argc, char* argv[])
 
   if (wait_for_inject)
   {
-    DWORD ThreadId = GetThreadId(ThreadHandle);
+    //DWORD ThreadId = GetThreadId(ThreadHandle);
     printf("Waiting on thread used for injection: %d\n", ThreadId);
     WaitForSingleObject(ThreadHandle, INFINITE);
   }
